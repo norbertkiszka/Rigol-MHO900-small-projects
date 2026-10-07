@@ -2,7 +2,7 @@
 // Tool to automatically and manually control PWM fan in the Rigol MHO900 series oscilloscopes, read temperatures (-r) and power off (-s).
 // Use -h switch to get full help about usage.
 // 
-// Version: 2.1
+// Version: 2.2
 //
 // NOTE: controlling the fan will not work fully properly with the stock app from the Rigol update v00.01.00.00.26, because toghether this and the app periodically will change PWM value in the kernel module, which will cause fan speed oscillations - app once per two seconds (in majority of cases always to 77) and this much more often. Older stock Rigol scope apps may change PWM value only once in some rare occasions, which is not a problem - in practice fan may go full speed for about one second.
 //
@@ -38,16 +38,20 @@
 #define DEBUG_TEMPERATURE_FILE_READ 0
 #define DEBUG_PWM_SET 0
 
+// 0 = proportional.
+// 1 = steps limited by proportional.
+#define DEFAULT_ALGORITHM 1
+
 #define PWM_MIN 75
 #define PWM_MANUAL_MIN 180
 
-#define DEFAULT_TEMP_FAN_OFF 35
+#define DEFAULT_TEMP_FAN_OFF 40
 #define DEFAULT_TEMP_MIN 45
 #define DEFAULT_TEMP_MAX 65
 #define EMERGENCY_SHUTDOWN_TEMP 90
 
 
-#define MHO900_FAN_VER 2.1
+#define MHO900_FAN_VER 2.2
 #define FILE_FAN "/dev/pwm_fan"
 #define FILE_TEMP0 "/sys/devices/virtual/thermal/thermal_zone0/temp"
 #define FILE_TEMP1 "/sys/devices/virtual/thermal/thermal_zone1/temp"
@@ -71,8 +75,11 @@
 // Value returned in case of unlikely read or parse problems. It must remain high to prevent accidental overheat and must be below EMERGENCY_SHUTDOWN_TEMP (multipled by 1000) to prevent inadvertent emergency shutdown.
 #define READ_FAIL_TEMP (EMERGENCY_SHUTDOWN_TEMP - 1) * 1000
 
+#define PRINTF_STRING_LINE "--------------------------------\n"
+
 static int fd_pwm = -1;
 static int8_t do_prints = 0;
+static int8_t signal_received = 0;
 
 static int32_t get_temp(char *file)
 {
@@ -123,10 +130,14 @@ static int32_t get_temp(char *file)
 
 static int32_t set_pwm(int v)
 {
-	int32_t ret = 0;
 #if DEBUG_PWM_SET
 	int32_t pwm_read;
 #endif
+	
+	if(signal_received)
+	{
+		v = 255;
+	}
 	
 #if !DEBUG_PWM_SET
 	if(do_prints)
@@ -151,8 +162,10 @@ static int32_t set_pwm(int v)
 	if(ioctl(fd_pwm, IOCTL_CMD_PWM_SET, v) < 0)
 	{
 		fprintf(stderr, "Ioctl set failed :/\n");
-		ret = 1;
+		close(fd_pwm);
+		fd_pwm = -1;
 		usleep(0xF0000);
+		return 1;
 	}
 	
 #if DEBUG_PWM_SET
@@ -167,17 +180,18 @@ static int32_t set_pwm(int v)
 		
 		if(pwm_read != v)
 		{
-			ret = 1;
 			usleep(0xF0000);
+			return 1;
 		}
 	}
 #endif
 	
-	return ret;
+	return 0;
 }
 
 static void signal_handler(int sig)
 {
+	signal_received = 1;
 	printf("Received signal %i.\n", sig);
 	set_pwm(255);
 	usleep(0xF0000); // In case of unlikely infinite loop.
@@ -194,26 +208,33 @@ static void usage(char *progname)
 	"\t-o #\tTemperature treshold to turn off the fan. Must be between 5 and 50. Default: " S(DEFAULT_TEMP_FAN_OFF) ".\n"
 	"\t-m #\tTemperature treshold/level to run fan at the minimum. Must be higher than off threshold by at least 5. Default: " S(DEFAULT_TEMP_MIN) ".\n"
 	"\t-M #\tTemperature level to run fan at the maximum. Must be higher than min threshold by at least 5 and can't be higher than 75. Default: " S(DEFAULT_TEMP_MAX) ".\n"
+	"\t-a #\tSelect algorithm. Default: " S(DEFAULT_ALGORITHM) ".\n"
 	"\n\t-p\tPrint temperature thresholds.\n"
-	"\n\t-d\tPrint temperature and PWM value (0-255) at every single PWM change.\n"
+	"\t-d\tPrint temperature and PWM value (0-255) at every single PWM change.\n"
 	"\n\t-r\tRead temperatures and exit.\n"
 	"\t-e #\tSet PWM fan value (" S(PWM_MANUAL_MIN) "-255) and exit.\n"
 	"\t-s #\tSwitch off the device within given amount of seconds.\n"
 	"\t-h\tPrint full help and exit.\n"
-	"\nAll temperatures are in Celsius. All arg parameters are integer only (full number without dot or comma).\n"
+	"\nAlgorithms to chose with -a switch:\n\n"
+	"\t0\tProportional - somehow stable temperature.\n"
+	"\t1\tSteps limited by proportional - stable temperature, usually by 2-4 degrees.\n"
+	"\nAll temperatures are in Celsius. All parameters are integer only.\n"
 	"\nCaution: higher temperatures for a prolonged time may significantly reduce life time of the device. It's highly recommended to keep temperatures below 60.\n"
 	);
 }
 
 static inline void help(char *progname)
 {
-	printf("\nMHO900 PWM fan controller by NK. Version: " S(MHO900_FAN_VER) "\n\n");
+	printf("\nMHO900 PWM fan controller by NK v" S(MHO900_FAN_VER) "\n\n");
+	
 	usage(progname);
+	
 	printf("\nExamples:\n"
+	"%s -pd\n"
 	"%s -o 40 -m 50 -M 75\n"
-	"%s -o 20 -m 30 -M 55 -d\n"
+	"%s -a 0 -o 20 -m 30 -M 55 -pd\n"
 	"%s -r -e 200\n\n"
-	, progname, progname, progname);
+	, progname, progname, progname, progname);
 }
 
 #define SHUTDOWN_ATTEMPTS 20
@@ -223,12 +244,14 @@ static void shutdown(void)
 	
 	for(i = 1; i <= SHUTDOWN_ATTEMPTS; i++)
 	{
+		sync();
+		usleep(0x3000);
 		fd = open(FILE_UART, O_WRONLY);
 		if(fd > -1)
 		{
 			write(fd, "\xfa\x05\x01\x2e\xaf", 5); // There is extremely low chance for write() failure. In such case something is screwed up totally and either You have random flipped bits on the SD card or You should throw Your scope out of the window.
 			usleep(0x30000); // After this, scope should be switched off long time ago, so the very next line shouldn't be executed.
-			fprintf(stderr, "Device shutdown failed. Attempt %i/" S(SHUTDOWN_ATTEMPTS) "\n", i);
+			fprintf(stderr, "Device shutdown failed. Attempt %i/" S(SHUTDOWN_ATTEMPTS) "\n", i); // Are we still alive?
 			close(fd);
 		}
 		else
@@ -239,21 +262,51 @@ static void shutdown(void)
 	}
 }
 
-// Separate function mainly to reduce compiled code in the main_loop().
 static void emergency_shutdown(int32_t tempmax)
 {
 	fprintf(stderr, "Emergency shutdown due to critical temperature: %.3f >= " S(EMERGENCY_SHUTDOWN_TEMP) "\n", TEMP2FLOAT(tempmax));
+	
 	shutdown();
-	while(1) // Just in case.
+	
+	// Just in case.
+	while(1)
 	{
 		set_pwm(255);
 		usleep(0x200000);
 	}
 }
 
-static void main_loop(int32_t setting_temp_fan_off, float f_setting_temp_fan_min, float f_setting_temp_fan_max, int32_t setting_temp_fan_max)
+static inline int32_t get_temp_max(void)
 {
-	int32_t tempmax, t;
+	int32_t t0, t1;
+	
+	t0 = GET_TEMP0();
+	t1 = GET_TEMP1();
+	
+	t0 = GETMAXFROM2(t0, t1);
+		
+	if(t0 >= (EMERGENCY_SHUTDOWN_TEMP * 1000))
+	{
+		emergency_shutdown(t0);
+	}
+	
+	return t0;
+}
+
+static inline void print_temp(int32_t temp)
+{
+	if(do_prints){printf("TEMP: %.2f\n", TEMP2FLOAT(temp));}
+}
+
+static inline void print_line(void)
+{
+	if(do_prints){printf(PRINTF_STRING_LINE);}
+}
+
+// Convert ints to floats before calling a function to prevent compiler from doing stupid things, like converting constant int to float and doing multiplication (as in TEMP2FLOAT()) in a loop.
+#define ALG_PROPORTIONAL(toff, tmin, tmax) alg_proportional(toff, tmin, tmax, TEMP2FLOAT(tmin), TEMP2FLOAT(tmax))
+static void alg_proportional(const int32_t toff, const int32_t tmin, const int32_t tmax, const float f_tmin, const float f_tmax)
+{
 	int32_t reads[32];
 	int32_t pwm;
 	int32_t temp;
@@ -261,25 +314,15 @@ static void main_loop(int32_t setting_temp_fan_off, float f_setting_temp_fan_min
 	int32_t readpointer = 0;
 	int32_t prev_pwm = 999; // prev_pwm should be initialized with any value outside of the range 0-255.
 	
-	// Reset the whole array. Fan most likely at this point is running at the full blast.
+	// Initialize the array. Fan most likely at this point is running at the full blast.
 	for(i = 0; i <= 31; i++)
 	{
-		reads[i] = setting_temp_fan_max;
+		reads[i] = tmax;
 	}
 	
 	while(1)
 	{
-		//tempmax = GETMAXFROM2(GET_TEMP0(), GET_TEMP1());
-		tempmax = GET_TEMP0();
-		t = GET_TEMP1();
-		tempmax = GETMAXFROM2(tempmax, t);
-		
-		if(tempmax >= (EMERGENCY_SHUTDOWN_TEMP * 1000))
-		{
-			emergency_shutdown(tempmax);
-		}
-		
-		reads[readpointer] = tempmax;
+		reads[readpointer] = get_temp_max();
 		
 		temp = 0;
 		for(i = 0; i <= 31; i++)
@@ -289,13 +332,13 @@ static void main_loop(int32_t setting_temp_fan_off, float f_setting_temp_fan_min
 		
 		temp = temp >> 5;
 		
-		if(temp < setting_temp_fan_off)
+		if(temp < toff)
 		{
 			pwm = 0;
 		}
-		else
+		else if(temp >= tmin)
 		{
-			pwm = (int32_t)(PWM_MIN + ( (TEMP2FLOAT(temp) - f_setting_temp_fan_min) / (f_setting_temp_fan_max - f_setting_temp_fan_min) ) * PWM_DIFF); // Black magic.
+			pwm = (int32_t)(PWM_MIN + ( (TEMP2FLOAT(temp) - f_tmin) / (f_tmax - f_tmin) ) * PWM_DIFF); // Black magic.
 			
 			if(pwm < PWM_MIN)
 			{
@@ -309,27 +352,130 @@ static void main_loop(int32_t setting_temp_fan_off, float f_setting_temp_fan_min
 		
 		if(pwm != prev_pwm)
 		{
-			if(do_prints)
-			{
-				printf("AVG TEMP: %.2f\n", TEMP2FLOAT(temp)); // PWM value is printed in set_pwm().
-			}
-			
-			if(set_pwm(pwm) == 0)
+			print_temp(temp);
+			if(set_pwm(pwm) == 0) // PWM value is printed in set_pwm().
 			{
 				prev_pwm = pwm; // Change prev_pwm only when PWM was succesfully set by ioctl. Otherwise, it will try again in the very next loop.
 			}
-			
-			if(do_prints)
-			{
-				printf("---------------------------\n");
-			}
+			print_line();
 		}
 		
 		usleep(0xF000); // 2s divided by 32. Rounded in hex, to reduce amount of CPU instructions (movk). Note: 3s makes significantly bigger oscillations.
 		
 		readpointer++;
-		
 		if(readpointer >= 32)
+		{
+			readpointer = 0;
+		}
+	}
+}
+
+#define ALG_STEPS(toff, tmin, tmax) alg_steps(toff, tmin, tmax, TEMP2FLOAT(tmin), TEMP2FLOAT(tmax))
+static void alg_steps(const int32_t toff, const int32_t tmin, const int32_t tmax, const float f_tmin, const float f_tmax)
+{
+	int32_t reads[8];
+	int32_t i, t, temp, prev_pwm, pwm, pwm_limit_max, pwm_limit_min, readpointer = 0;
+	int32_t temp_mid = (tmin + tmax) >> 1;
+	
+	temp = get_temp_max();
+	
+	if(temp < toff)
+	{
+		pwm = 0;
+	}
+	else
+	{
+		// Init pwm value as it's calculated in alg_linear()
+		pwm = (int32_t)(PWM_MIN + ( (TEMP2FLOAT(temp) - f_tmin) / (f_tmax - f_tmin) ) * PWM_DIFF);
+		if(pwm < PWM_MIN)
+		{
+			pwm = PWM_MIN;
+		}
+		if(pwm > 255)
+		{
+			pwm = 255;
+		}
+	}
+	
+	print_temp(temp);
+	set_pwm(pwm);
+	prev_pwm = pwm;
+	print_line();
+	usleep(0x300000);
+	
+	for(i = 0; i <= 7; i++)
+	{
+		reads[i] = temp;
+	}
+	
+	while(1)
+	{
+		reads[readpointer] = get_temp_max();
+		
+		temp = 0;
+		for(i = 0; i <= 7; i++)
+		{
+			temp += reads[i]; // Compiler should use vector instructions here.
+		}
+		
+		temp = temp >> 3;
+		
+		if(temp < toff)
+		{
+			pwm = 0;
+		}
+		else if(temp >= tmax)
+		{
+			pwm = 255;
+		}
+		else if(pwm == 0 && temp >= tmin)
+		{
+			pwm = PWM_MIN;
+		}
+		else
+		{
+			t = (int32_t)(PWM_MIN + ( (TEMP2FLOAT(temp) - f_tmin) / (f_tmax - f_tmin) ) * PWM_DIFF);
+			pwm_limit_max = t + 26;
+			pwm_limit_min = t - 26;
+			
+			pwm += (temp - temp_mid) >> 9;
+			
+			if(pwm > pwm_limit_max)
+			{
+				pwm = pwm_limit_max;
+			}
+			
+			if(pwm < pwm_limit_min)
+			{
+				pwm = pwm_limit_min;
+			}
+			
+			if(pwm > 255)
+			{
+				pwm = 255;
+			}
+			if(pwm < PWM_MIN)
+			{
+				pwm = PWM_MIN;
+			}
+		}
+		
+		if(pwm != prev_pwm)
+		{
+			print_temp(temp);
+			if(do_prints)
+			{
+				printf("PWM L MIN: %i PWM L MAX: %i\n", pwm_limit_min, pwm_limit_max);
+			}
+			set_pwm(pwm); // PWM value is printed in set_pwm().
+			print_line();
+			prev_pwm = pwm;
+		}
+		
+		usleep(0x20000);
+		
+		readpointer++;
+		if(readpointer >= 8)
 		{
 			readpointer = 0;
 		}
@@ -338,14 +484,14 @@ static void main_loop(int32_t setting_temp_fan_off, float f_setting_temp_fan_min
 
 int main(int argc, char *argv[])
 {
-	int32_t option, t, ret = 0, set_pwm_manual = -1, shutdown_seconds = -1;
-	int8_t do_exit = 0, print_settings = 0;
+	int32_t i, option, t, ret = 0, set_pwm_manual = -1, shutdown_seconds = -1;
+	int8_t do_exit = 0, print_settings = 0, algorithm = DEFAULT_ALGORITHM;
 	
 	int32_t setting_temp_fan_off = DEFAULT_TEMP_FAN_OFF * 1000;
 	int32_t setting_temp_fan_min = DEFAULT_TEMP_MIN * 1000;
 	int32_t setting_temp_fan_max = DEFAULT_TEMP_MAX * 1000;
 	
-	while((option = getopt(argc, argv, "dhro:m:M:e:ps:")) != -1)
+	while((option = getopt(argc, argv, "dhro:m:M:e:ps:a:")) != -1)
 	{
 		switch (option)
 		{
@@ -415,10 +561,16 @@ int main(int argc, char *argv[])
 				}
 			break;
 			
+			case 'a':
+				algorithm = atoi(optarg);
+			break;
+			
 			case ':':
 			case '?':
+				printf("\n");
 				usage(argv[0]);
-				do_exit = 1;
+				//do_exit = 1;
+				_exit(1);
 			break;
 			
 			default:
@@ -477,10 +629,10 @@ int main(int argc, char *argv[])
 		_exit(ret);
 	}
 	
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
-	signal(SIGFPE, signal_handler);
-	signal(SIGTSTP, signal_handler);
+	for(i = 1; i <= 64; i++)
+	{
+		signal(i, signal_handler);
+	}
 	
 	if(setting_temp_fan_max > 75000)
 	{
@@ -507,10 +659,24 @@ int main(int argc, char *argv[])
 			"Off threshold: %i\n"
 			"Min threshold: %i\n"
 			"Max threshold: %i\n"
-		, setting_temp_fan_off / 1000, setting_temp_fan_min / 1000, setting_temp_fan_max / 1000);
+			"Min/max average: %i\n"
+			PRINTF_STRING_LINE
+		, setting_temp_fan_off / 1000, setting_temp_fan_min / 1000, setting_temp_fan_max / 1000, (setting_temp_fan_min + setting_temp_fan_max) / 2000);
 	}
 	
-	main_loop(setting_temp_fan_off, TEMP2FLOAT(setting_temp_fan_min), TEMP2FLOAT(setting_temp_fan_max), setting_temp_fan_max); // Compiler should ignore everything after this line, because it contains infinite loop.
+	switch(algorithm)
+	{
+		case 0:
+			ALG_PROPORTIONAL(setting_temp_fan_off, setting_temp_fan_min, setting_temp_fan_max);
+		
+		default:
+			fprintf(stderr, "Unknown selected algorithm: %i. Executing limited steps.\n", algorithm);
+			
+		case 1:
+			ALG_STEPS(setting_temp_fan_off, setting_temp_fan_min, setting_temp_fan_max);
+	}
+	
+	// Compiler should ignore everything after this line, because we have infinite loop above.
 	
 	set_pwm(255); // Must be the wind.
 	printf("You shouldn't see this message...\n");
